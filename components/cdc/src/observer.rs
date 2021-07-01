@@ -60,7 +60,7 @@ impl CdcObserver {
     /// Subscribe an region, the observer will sink events of the region into
     /// its scheduler.
     ///
-    /// Return pervious ObserveID if there is one.
+    /// Return previous ObserveID if there is one.
     pub fn subscribe_region(&self, region_id: u64, observe_id: ObserveID) -> Option<ObserveID> {
         self.observe_regions
             .write()
@@ -140,7 +140,7 @@ impl RoleObserver for CdcObserver {
         if role != StateRole::Leader {
             let region_id = ctx.region().get_id();
             if let Some(observe_id) = self.is_subscribed(region_id) {
-                // Unregister all downstreams.
+                // Unregister all downstream.
                 let store_err = RaftStoreError::NotLeader(region_id, None);
                 let deregister = Deregister::Delegate {
                     region_id,
