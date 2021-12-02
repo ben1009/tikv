@@ -8,7 +8,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 use std::{error::Error as StdError, result, str, thread, time, u64};
 
 use fail::fail_point;
@@ -33,9 +32,9 @@ use file_system::{
     File, Metadata, OpenOptions,
 };
 use keys::{enc_end_key, enc_start_key};
-use tikv_util::time::{duration_to_sec, Limiter};
+use tikv_util::time::{duration_to_sec, Instant, Limiter};
 use tikv_util::HandyRwLock;
-use tikv_util::{box_err, box_try, debug, error, info, map, warn};
+use tikv_util::{box_err, box_try, debug, error, info, warn};
 
 use crate::coprocessor::CoprocessorHost;
 use crate::store::metrics::{
@@ -233,7 +232,7 @@ fn calc_checksum_and_size(
     let (checksum, size) = if let Some(mgr) = encryption_key_manager {
         // Crc32 and file size need to be calculated based on decrypted contents.
         let file_name = path.to_str().unwrap();
-        let mut r = snap_io::get_decrypter_reader(file_name, &mgr)?;
+        let mut r = snap_io::get_decrypter_reader(file_name, mgr)?;
         calc_crc32_and_size(&mut r)?
     } else {
         (calc_crc32(path)?, get_file_size(path)?)
@@ -588,7 +587,7 @@ impl Snapshot {
         )
     }
 
-    fn validate(&self, engine: &impl KvEngine, for_send: bool) -> RaftStoreResult<()> {
+    fn validate(&self, for_send: bool) -> RaftStoreResult<()> {
         for cf_file in &self.cf_files {
             if cf_file.size == 0 {
                 // Skip empty file. The checksum of this cf file should be 0 and
@@ -596,10 +595,6 @@ impl Snapshot {
                 continue;
             }
 
-            if !plain_file_used(cf_file.cf) {
-                // Reset global seq number.
-                engine.reset_global_seq(&cf_file.cf, &cf_file.path)?;
-            }
             check_file_size_and_checksum(
                 &cf_file.path,
                 cf_file.size,
@@ -666,7 +661,7 @@ impl Snapshot {
     {
         fail_point!("snapshot_enter_do_build");
         if self.exists() {
-            match self.validate(engine, true) {
+            match self.validate(true) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     error!(?e;
@@ -802,21 +797,21 @@ impl Snapshot {
         snap_data.set_version(SNAPSHOT_VERSION);
         snap_data.set_meta(self.meta_file.meta.clone());
 
-        SNAPSHOT_BUILD_TIME_HISTOGRAM.observe(duration_to_sec(t.elapsed()) as f64);
+        SNAPSHOT_BUILD_TIME_HISTOGRAM.observe(duration_to_sec(t.saturating_elapsed()) as f64);
         info!(
             "scan snapshot";
             "region_id" => region.get_id(),
             "snapshot" => self.path(),
             "key_count" => stat.kv_count,
             "size" => total_size,
-            "takes" => ?t.elapsed(),
+            "takes" => ?t.saturating_elapsed(),
         );
 
         Ok(())
     }
 
     pub fn apply<EK: KvEngine>(&mut self, options: ApplyOptions<EK>) -> Result<()> {
-        box_try!(self.validate(&options.db, false));
+        box_try!(self.validate(false));
 
         let abort_checker = ApplyAbortChecker(options.abort);
         let coprocessor_host = options.coprocessor_host;
@@ -1132,6 +1127,7 @@ impl SnapManager {
         Ok(())
     }
 
+    // [PerformanceCriticalPath]?? I/O involved API should be called in background thread
     // Return all snapshots which is idle not being used.
     pub fn list_idle_snap(&self) -> io::Result<Vec<(SnapKey, bool)>> {
         // Use a lock to protect the directory when scanning.
@@ -1252,6 +1248,11 @@ impl SnapManager {
         let _lock = self.core.registry.rl();
         let base = &self.core.base;
         let s = Snapshot::new(base, key, is_sending, CheckPolicy::None, &self.core)?;
+        fail_point!(
+            "get_snapshot_for_gc",
+            key.region_id == 2 && key.idx == 1,
+            |_| { Err(box_err!("invalid cf number of snapshot meta")) }
+        );
         Ok(Box::new(s))
     }
 
@@ -1515,7 +1516,7 @@ impl SnapManagerBuilder {
         SnapManager {
             core: SnapManagerCore {
                 base: path.into(),
-                registry: Arc::new(RwLock::new(map![])),
+                registry: Default::default(),
                 limiter,
                 temp_sst_id: Arc::new(AtomicU64::new(0)),
                 encryption_key_manager: self.key_manager,
@@ -1532,7 +1533,7 @@ pub mod tests {
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     use encryption::{EncryptionConfig, FileConfig, MasterKeyConfig};
     use encryption_export::data_key_manager_from_config;
@@ -1553,7 +1554,6 @@ pub mod tests {
 
     use protobuf::Message;
     use tempfile::{Builder, TempDir};
-    use tikv_util::map;
     use tikv_util::time::Limiter;
 
     use super::{
@@ -1699,7 +1699,7 @@ pub mod tests {
     fn create_manager_core(path: &str) -> SnapManagerCore {
         SnapManagerCore {
             base: path.to_owned(),
-            registry: Arc::new(RwLock::new(map![])),
+            registry: Default::default(),
             limiter: Limiter::new(f64::INFINITY),
             temp_sst_id: Arc::new(AtomicU64::new(0)),
             encryption_key_manager: None,
@@ -1805,7 +1805,7 @@ pub mod tests {
             .prefix("test-snap-file-db-src")
             .tempdir()
             .unwrap();
-        let db = get_db(&src_db_dir.path(), db_opt.clone(), None).unwrap();
+        let db = get_db(src_db_dir.path(), db_opt.clone(), None).unwrap();
         let snapshot = db.snapshot();
 
         let src_dir = Builder::new()
@@ -1922,7 +1922,7 @@ pub mod tests {
             .prefix("test-snap-validation-db")
             .tempdir()
             .unwrap();
-        let db = get_db(&db_dir.path(), None, None).unwrap();
+        let db = get_db(db_dir.path(), None, None).unwrap();
         let snapshot = db.snapshot();
 
         let dir = Builder::new()
@@ -2089,7 +2089,7 @@ pub mod tests {
             .prefix("test-snap-corruption-db")
             .tempdir()
             .unwrap();
-        let db: KvTestEngine = open_test_db(&db_dir.path(), None, None).unwrap();
+        let db: KvTestEngine = open_test_db(db_dir.path(), None, None).unwrap();
         let snapshot = db.snapshot();
 
         let dir = Builder::new()
@@ -2155,7 +2155,7 @@ pub mod tests {
             .prefix("test-snap-corruption-dst-db")
             .tempdir()
             .unwrap();
-        let dst_db: KvTestEngine = open_test_empty_db(&dst_db_dir.path(), None, None).unwrap();
+        let dst_db: KvTestEngine = open_test_empty_db(dst_db_dir.path(), None, None).unwrap();
         let options = ApplyOptions {
             db: dst_db,
             region,
@@ -2178,7 +2178,7 @@ pub mod tests {
             .prefix("test-snapshot-corruption-meta-db")
             .tempdir()
             .unwrap();
-        let db: KvTestEngine = open_test_db(&db_dir.path(), None, None).unwrap();
+        let db: KvTestEngine = open_test_db(db_dir.path(), None, None).unwrap();
         let snapshot = db.snapshot();
 
         let dir = Builder::new()
@@ -2276,7 +2276,7 @@ pub mod tests {
             .prefix("test-snap-mgr-delete-temp-files-v2-db")
             .tempdir()
             .unwrap();
-        let db: KvTestEngine = open_test_db(&db_dir.path(), None, None).unwrap();
+        let db: KvTestEngine = open_test_db(db_dir.path(), None, None).unwrap();
         let snapshot = db.snapshot();
         let key1 = SnapKey::new(1, 1, 1);
         let mgr_core = create_manager_core(&path);
@@ -2356,7 +2356,7 @@ pub mod tests {
             .prefix("test-snap-deletion-on-registry-src-db")
             .tempdir()
             .unwrap();
-        let db: KvTestEngine = open_test_db(&src_db_dir.path(), None, None).unwrap();
+        let db: KvTestEngine = open_test_db(src_db_dir.path(), None, None).unwrap();
         let snapshot = db.snapshot();
 
         let key = SnapKey::new(1, 1, 1);
@@ -2505,7 +2505,7 @@ pub mod tests {
             .prefix("test_snap_temp_file_delete_kv")
             .tempdir()
             .unwrap();
-        let engine = open_test_db(&kv_temp_dir.path(), None, None).unwrap();
+        let engine = open_test_db(kv_temp_dir.path(), None, None).unwrap();
         let sst_path = src_mgr.get_temp_path_for_ingest();
         let mut writer = <KvTestEngine as SstExt>::SstWriterBuilder::new()
             .set_db(&engine)
@@ -2524,7 +2524,7 @@ pub mod tests {
 
     #[test]
     fn test_build_with_encryption() {
-        let (_enc_dir, key_path, dict_path) = create_enc_dir(&"test_build_with_encryption_enc");
+        let (_enc_dir, key_path, dict_path) = create_enc_dir("test_build_with_encryption_enc");
         let enc_cfg = EncryptionConfig {
             data_encryption_method: EncryptionMethod::Aes128Ctr,
             master_key: MasterKeyConfig::File {
